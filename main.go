@@ -4,12 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"log"
 	"os"
 	"strconv"
 	"sync"
-
-	"github.com/jackc/pgx/v5"
 )
 
 const (
@@ -25,83 +24,73 @@ func main() {
 	}
 
 	// Read in connection string
-	config, err := pgx.ParseConfig(dbURL)
+	config, err := pgxpool.ParseConfig(dbURL)
 	if err != nil {
 		log.Fatal(err)
 	}
-	conn, err := pgx.ConnectConfig(context.Background(), config)
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Fprintf(os.Stderr, "Unable to create connection pool: %v\n", err)
+		os.Exit(1)
 	}
-	defer conn.Close(context.Background())
+	defer pool.Close()
 
 	// Setup tables.
-	mustExec(conn, "DROP TABLE IF EXISTS c")
-	mustExec(conn, "DROP TABLE IF EXISTS p")
-	mustExec(conn, "CREATE TABLE p (id INT PRIMARY KEY, t TEXT)")
-	mustExec(conn, "CREATE TABLE c (id INT PRIMARY KEY, p_id INT NOT NULL REFERENCES p(id) ON DELETE CASCADE, t TEXT)")
+	mustExec(pool, "DROP TABLE IF EXISTS c")
+	mustExec(pool, "DROP TABLE IF EXISTS p")
+	mustExec(pool, "CREATE TABLE p (id INT PRIMARY KEY, t TEXT)")
+	mustExec(pool, "CREATE TABLE c (id INT PRIMARY KEY, p_id INT NOT NULL REFERENCES p(id) ON DELETE CASCADE, t TEXT)")
 
+	// INSERT into p and c in parallel.
 	fmt.Println("starting inserts...")
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		conn, err := pgx.ConnectConfig(context.Background(), config)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer conn.Close(context.Background())
+	execMany(pool, numInserts, &wg, func(i int) (sql string) {
+		return fmt.Sprintf("INSERT INTO p VALUES (%d, 'some text')", i)
+	})
 
-		execMany(conn, numInserts, func(i int) (sql string) {
-			return fmt.Sprintf("INSERT INTO p VALUES (%d, 'some text')", i)
-		})
-		wg.Done()
-	}()
-
-	wg.Add(1)
-	go func() {
-		conn, err := pgx.ConnectConfig(context.Background(), config)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer conn.Close(context.Background())
-
-		execMany(conn, numInserts, func(i int) (sql string) {
-			return fmt.Sprintf("INSERT INTO c VALUES (%d, %d, 'some text')", i, i)
-		})
-		wg.Done()
-	}()
+	execMany(pool, numInserts, &wg, func(i int) (sql string) {
+		return fmt.Sprintf("INSERT INTO c VALUES (%d, %d, 'some text')", i, i)
+	})
 
 	wg.Wait()
 	fmt.Println("done")
 }
 
-func mustExec(conn *pgx.Conn, sql string) {
+func mustExec(conn *pgxpool.Pool, sql string) {
 	_, err := conn.Exec(context.Background(), sql)
 	if err != nil {
 		panic(err)
 	}
 }
 
-func execMany(conn *pgx.Conn, times int, genSQL func(i int) (sql string)) {
-	inserted := make([]bool, times)
-	for {
-		for i := range inserted {
-			sql := genSQL(i)
-			if _, err := conn.Exec(context.Background(), sql); err != nil {
-				inserted[i] = true
-			}
-		}
+func execMany(pool *pgxpool.Pool, times int, wg *sync.WaitGroup, genSQL func(i int) (sql string)) {
+	const concurrency = 4
+	for c := 0; c < concurrency; c++ {
+		wg.Add(1)
+		go func(c int) {
+			inserted := make([]bool, times/concurrency)
+			offset := c * (times / concurrency)
+			for {
+				for i := range inserted {
+					sql := genSQL(i + offset)
+					if _, err := pool.Exec(context.Background(), sql); err != nil {
+						inserted[i] = true
+					}
+				}
 
-		// Check if all inserts have succeeded.
-		done := true
-		for i := range inserted {
-			if !inserted[i] {
-				done = false
-				break
+				// Check if all inserts have succeeded.
+				done := true
+				for i := range inserted {
+					if !inserted[i] {
+						done = false
+						break
+					}
+				}
+				if done {
+					break
+				}
 			}
-		}
-		if done {
-			break
-		}
+			wg.Done()
+		}(c)
 	}
 }
