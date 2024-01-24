@@ -7,29 +7,30 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"log"
 	"os"
-	"strconv"
+	"strings"
 	"sync"
+	"time"
 )
 
 const (
 	dbURL = "postgresql://root@127.0.0.1:26257/defaultdb?sslmode=disable"
 )
 
+var (
+	numInserts  = flag.Int("n", 100, "number of inserts")
+	concurrency = flag.Int("g", 100, "max number of concurrent inserts to a table")
+	numConns    = flag.Int("c", 100, "max number of connections")
+)
+
 func main() {
 	flag.Parse()
-	numInserts, err := strconv.Atoi(flag.Arg(0))
-	concurrency, err := strconv.Atoi(flag.Arg(1))
-	if err != nil {
-		fmt.Println("usage: ./repro <num inserts> <concurrency>\nexample: ./repro 1000 500")
-		os.Exit(0)
-	}
 
 	// Read in connection string
 	config, err := pgxpool.ParseConfig(dbURL)
 	if err != nil {
 		log.Fatal(err)
 	}
-	config.MaxConns = 1000
+	config.MaxConns = int32(*numConns)
 	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to create connection pool: %v\n", err)
@@ -46,16 +47,20 @@ func main() {
 	// INSERT into p and c in parallel.
 	fmt.Println("starting inserts...")
 	var wg sync.WaitGroup
-	execMany(pool, numInserts, concurrency, &wg, func(i int) (sql string) {
+	pStats := NewStats("p-inserts")
+	execMany(pool, *numInserts, *concurrency, &wg, pStats, func(i int) (sql string) {
 		return fmt.Sprintf("INSERT INTO p VALUES (%d, 'some text')", i)
 	})
 
-	execMany(pool, numInserts, concurrency, &wg, func(i int) (sql string) {
+	cStats := NewStats("c-inserts")
+	execMany(pool, *numInserts, *concurrency, &wg, cStats, func(i int) (sql string) {
 		return fmt.Sprintf("INSERT INTO c VALUES (%d, %d, 'some text')", i, i)
 	})
 
 	wg.Wait()
 	fmt.Println("done")
+	fmt.Println(pStats.String())
+	fmt.Println(cStats.String())
 }
 
 func mustExec(conn *pgxpool.Pool, sql string) {
@@ -65,19 +70,23 @@ func mustExec(conn *pgxpool.Pool, sql string) {
 	}
 }
 
-func execMany(pool *pgxpool.Pool, times int, concurrency int, wg *sync.WaitGroup, genSQL func(i int) (sql string)) {
+func execMany(pool *pgxpool.Pool, times int, concurrency int, wg *sync.WaitGroup, s *Stats, genSQL func(i int) (sql string)) {
 	for c := 0; c < concurrency; c++ {
 		wg.Add(1)
+
 		go func(c int) {
+			var localStats Stats
 			inserted := make([]bool, times/concurrency)
 			offset := c * (times / concurrency)
 			for {
 				for i := range inserted {
 					if !inserted[i] {
 						sql := genSQL(i + offset)
-						if _, err := pool.Exec(context.Background(), sql); err == nil {
-							inserted[i] = true
-						}
+						localStats.Time(func() {
+							if _, err := pool.Exec(context.Background(), sql); err == nil {
+								inserted[i] = true
+							}
+						})
 					}
 				}
 
@@ -93,7 +102,49 @@ func execMany(pool *pgxpool.Pool, times int, concurrency int, wg *sync.WaitGroup
 					break
 				}
 			}
+
+			s.mu.Lock()
+			s.Merge(&localStats)
+			s.mu.Unlock()
 			wg.Done()
 		}(c)
 	}
+}
+
+type Stats struct {
+	name        string
+	count       int
+	totalMillis int64
+	maxMillis   int64
+	mu          sync.Mutex
+}
+
+func NewStats(name string) *Stats {
+	return &Stats{name: name}
+}
+
+func (s *Stats) Time(fn func()) {
+	start := time.Now()
+	fn()
+	d := time.Since(start).Milliseconds()
+	s.totalMillis += d
+	s.maxMillis = max(s.maxMillis, d)
+	s.count++
+}
+
+func (s *Stats) Merge(other *Stats) {
+	s.totalMillis += other.totalMillis
+	s.count += other.count
+	s.maxMillis = max(s.maxMillis, other.maxMillis)
+}
+
+func (s *Stats) String() string {
+	var sb strings.Builder
+	sb.WriteString(s.name)
+	sb.WriteString(": ")
+	sb.WriteString(fmt.Sprintf(
+		"count=%d, avg_time=%dms, max_time=%dms",
+		s.count, s.totalMillis/int64(s.count), s.maxMillis,
+	))
+	return sb.String()
 }
