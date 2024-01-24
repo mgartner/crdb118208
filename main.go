@@ -17,9 +17,12 @@ const (
 )
 
 var (
-	numInserts  = flag.Int("n", 100, "number of inserts")
-	concurrency = flag.Int("g", 100, "max number of concurrent inserts to a table")
-	numConns    = flag.Int("c", 100, "max number of connections")
+	numParents       = flag.Int("np", 100, "number of inserts to parent table")
+	numChildren      = flag.Int("nc", 100, "number of inserts to child table")
+	maxChildAttempts = flag.Int("mc", 0, "maximum number of insert attempts for a child row; 0 indicates no maximum")
+	concurrency      = flag.Int("g", 100, "max number of concurrent inserts to a table")
+	numConns         = flag.Int("c", 100, "max number of connections")
+	wait             = flag.Bool("w", false, "wait for all parents to be inserted before inserting children")
 )
 
 func main() {
@@ -48,12 +51,17 @@ func main() {
 	fmt.Println("starting inserts...")
 	var wg sync.WaitGroup
 	pStats := NewStats("p-inserts")
-	execMany(pool, *numInserts, *concurrency, &wg, pStats, func(i int) (sql string) {
+	execMany(pool, *numParents, 0, *concurrency, &wg, pStats, func(i int) (sql string) {
 		return fmt.Sprintf("INSERT INTO p VALUES (%d, 'some text')", i)
 	})
 
+	if *wait {
+		// Wait for the parents to finish inserting.
+		wg.Wait()
+	}
+
 	cStats := NewStats("c-inserts")
-	execMany(pool, *numInserts, *concurrency, &wg, cStats, func(i int) (sql string) {
+	execMany(pool, *numChildren, *maxChildAttempts, *concurrency, &wg, cStats, func(i int) (sql string) {
 		return fmt.Sprintf("INSERT INTO c VALUES (%d, %d, 'some text')", i, i)
 	})
 
@@ -70,30 +78,40 @@ func mustExec(conn *pgxpool.Pool, sql string) {
 	}
 }
 
-func execMany(pool *pgxpool.Pool, times int, concurrency int, wg *sync.WaitGroup, s *Stats, genSQL func(i int) (sql string)) {
+func execMany(pool *pgxpool.Pool, times int, maxAttempts int, concurrency int, wg *sync.WaitGroup, s *Stats, genSQL func(i int) (sql string)) {
+	if times <= 0 {
+		return
+	}
 	for c := 0; c < concurrency; c++ {
 		wg.Add(1)
 
 		go func(c int) {
 			var localStats Stats
-			inserted := make([]bool, times/concurrency)
+			insertsCompleted := make([]bool, times/concurrency)
+			insertAttempts := make([]int, times/concurrency)
 			offset := c * (times / concurrency)
 			for {
-				for i := range inserted {
-					if !inserted[i] {
-						sql := genSQL(i + offset)
-						localStats.Time(func() {
-							if _, err := pool.Exec(context.Background(), sql); err == nil {
-								inserted[i] = true
-							}
-						})
+				for i := range insertAttempts {
+					if insertsCompleted[i] {
+						continue
 					}
+					if maxAttempts > 0 && insertAttempts[i] >= maxAttempts {
+						insertsCompleted[i] = true
+						continue
+					}
+					insertAttempts[i]++
+					sql := genSQL(i + offset)
+					localStats.Time(func() {
+						if _, err := pool.Exec(context.Background(), sql); err == nil {
+							insertsCompleted[i] = true
+						}
+					})
 				}
 
 				// Check if all inserts have succeeded.
 				done := true
-				for i := range inserted {
-					if !inserted[i] {
+				for i := range insertsCompleted {
+					if !insertsCompleted[i] {
 						done = false
 						break
 					}
@@ -139,6 +157,9 @@ func (s *Stats) Merge(other *Stats) {
 }
 
 func (s *Stats) String() string {
+	if s.count == 0 {
+		return ""
+	}
 	var sb strings.Builder
 	sb.WriteString(s.name)
 	sb.WriteString(": ")
